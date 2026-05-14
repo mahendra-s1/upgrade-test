@@ -47,7 +47,11 @@ ROOT_DIR="${ROOT_DIR:-${INSTALL_DIR:-/opt/observo}}"
 INSTALL_DIR="$ROOT_DIR"
 CONFIG_DIR="$ROOT_DIR"          # edge-config.json + effective.yaml live in the root
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
-UPGRADE_DIR="${UPGRADE_DIR:-$ROOT_DIR/upgrade}"
+# UPDATE_DIR is the on-disk staging area for in-flight updates and the
+# heartbeat socket the watcher uses to coordinate with the supervisor.
+# Must match server.DefaultUpdateStagingDir in
+# internal/server/constant_linux.go ($ROOT_DIR/update).
+UPDATE_DIR="${UPDATE_DIR:-$ROOT_DIR/update}"
 TMP_DIR="${TMP_DIR:-/tmp/observo}"
 TAR_FILE="$TMP_DIR/edge.tar.gz"
 EXTRACT_DIR="$TMP_DIR/binaries_edge"
@@ -144,6 +148,23 @@ parse_environment_variable() {
     else
         echo "Error: download_url not found in argument"
         return 1  # Failure
+    fi
+
+    # checksum=<base64-sha256> is the SHA256 of the release tarball,
+    # read directly from the S3 object's ChecksumSHA256 attribute by
+    # fleet-manager. S3 returns this as base64 (NOT hex), so we keep
+    # it in that form end-to-end and compare via
+    # `openssl dgst -sha256 -binary FILE | base64`. We verify the
+    # downloaded tarball against it BEFORE extracting (see
+    # download_and_extract_agent). Mandatory: an install without
+    # verification is a supply-chain hole.
+    if [[ "$env_var" =~ checksum=([A-Za-z0-9+/=]+) ]]; then
+        EXPECTED_CHECKSUM="${BASH_REMATCH[1]}"
+        echo "Extracted checksum: $EXPECTED_CHECKSUM"
+        export EXPECTED_CHECKSUM
+    else
+        echo "Error: checksum not found in argument"
+        return 1
     fi
 
     return 0 # Success
@@ -267,6 +288,29 @@ download_and_extract_agent() {
     
     echo "Download completed and saved to $TAR_FILE (size: $FILE_SIZE bytes)"
 
+    # Verify the downloaded tarball's SHA256 matches the value
+    # fleet-manager pulled from S3 (ChecksumSHA256, base64-encoded).
+    # We compute the same way the update watcher does so the two
+    # always agree: raw SHA256 → base64. Fail closed on mismatch —
+    # do NOT proceed to extract a binary we can't verify.
+    if command -v openssl >/dev/null 2>&1; then
+        ACTUAL_CHECKSUM=$(openssl dgst -sha256 -binary "$TAR_FILE" | openssl base64 -A)
+    elif command -v sha256sum >/dev/null 2>&1; then
+        # Fallback: sha256sum emits hex, convert to base64.
+        ACTUAL_CHECKSUM=$(sha256sum "$TAR_FILE" | awk '{print $1}' | xxd -r -p | base64)
+    else
+        echo "Error: neither openssl nor sha256sum is installed; cannot verify download integrity"
+        exit 1
+    fi
+    if [[ "$ACTUAL_CHECKSUM" != "$EXPECTED_CHECKSUM" ]]; then
+        echo "Error: checksum mismatch for $TAR_FILE"
+        echo "  expected (from S3): $EXPECTED_CHECKSUM"
+        echo "  actual (computed):  $ACTUAL_CHECKSUM"
+        echo "Refusing to install a tampered or corrupted binary."
+        exit 1
+    fi
+    echo "Checksum verified: $ACTUAL_CHECKSUM"
+
     mkdir -p "$EXTRACT_DIR"
     echo "Extracting $TAR_FILE to $EXTRACT_DIR"
     tar -xzvf "$TAR_FILE" -C "$EXTRACT_DIR" || { echo "Extraction failed!"; exit 1; }
@@ -297,7 +341,7 @@ move_to_bin_and_make_executable() {
         # up with identical ownership and exec permissions. The
         # supervisor fork/execs the watcher under the same UID it runs
         # under (the systemd User= below), so any mismatch surfaces as
-        # `fork/exec ... operation not permitted` at upgrade time. Set
+        # `fork/exec ... operation not permitted` at update time. Set
         # mode + ownership explicitly here per file rather than
         # relying solely on the directory-wide chown later, so even if
         # the bundle's tar entries carried stray uid/mode bits we
@@ -325,7 +369,7 @@ move_to_bin_and_make_executable() {
 
     # Sanity check: confirm each binary is owned by root and is executable.
     # Catching this here is much friendlier than the later "fork/exec ...: operation not permitted"
-    # failure the supervisor would log mid-upgrade.
+    # failure the supervisor would log mid-update.
     for bin in "$EDGE_EXECUTABLE" "$WATCHER_EXECUTABLE" "$WORKER_EXECUTABLE_PATH"; do
         if [[ ! -x "$bin" ]]; then
             echo "Error: $bin is not executable after install" >&2
@@ -402,11 +446,11 @@ create_system_user() {
 setup_directories() {
     # Lay down the canonical directory tree:
     #   $ROOT_DIR/                  binaries + edge-config.json + effective.yaml
-    #   $ROOT_DIR/logs/             edge-worker, supervisor, upgrade-watcher logs
-    #   $ROOT_DIR/upgrade/          staging dir + heartbeat socket + flag file
+    #   $ROOT_DIR/logs/             edge-worker, supervisor, update-watcher logs
+    #   $ROOT_DIR/update/           staging dir + heartbeat socket + flag file
     # Single chown -R later normalises ownership across the whole tree.
     echo "Setting up edge directory tree under $ROOT_DIR"
-    for d in "$ROOT_DIR" "$LOG_DIR" "$UPGRADE_DIR"; do
+    for d in "$ROOT_DIR" "$LOG_DIR" "$UPDATE_DIR"; do
         if [ ! -d "$d" ]; then
             echo "  creating $d"
             sudo mkdir -p "$d" || { echo "Failed to create $d"; exit 1; }
@@ -414,9 +458,9 @@ setup_directories() {
     done
 
     echo "Setting ownership to root:root (edge runs as root)"
-    sudo chown root:root "$ROOT_DIR" "$LOG_DIR" "$UPGRADE_DIR" \
+    sudo chown root:root "$ROOT_DIR" "$LOG_DIR" "$UPDATE_DIR" \
         || { echo "Failed to set ownership on edge directories"; exit 1; }
-    sudo chmod 0755 "$ROOT_DIR" "$LOG_DIR" "$UPGRADE_DIR"
+    sudo chmod 0755 "$ROOT_DIR" "$LOG_DIR" "$UPDATE_DIR"
 }
 
 create_systemd_service() {
@@ -459,7 +503,7 @@ Type=simple
 ExecStart=$EDGE_EXECUTABLE
 Restart=always
 RestartSec=5
-# NOTE: edge runs as root so the upgrade watcher (spawned by edge) inherits
+# NOTE: edge runs as root so the update watcher (spawned by edge) inherits
 # root privileges and can call systemctl restart/stop directly without sudo.
 # Running as root also avoids permission issues with /opt/observo files.
 User=root
@@ -502,7 +546,7 @@ echo "$OBSERVO_HEADING"
 #1 create user and group
 create_system_user
 
-#2 setup root + logs + upgrade directory tree
+#2 setup root + logs + update directory tree
 setup_directories
 
 #3 check and parse environment variable
